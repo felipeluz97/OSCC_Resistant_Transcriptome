@@ -1,0 +1,225 @@
+library(data.table)
+TCGA_clinical = fread("~/projetos/felipeluz/dieila/RNAseq/Validation/clinical.tsv")
+TCGA_clinical_cisplatin = TCGA_clinical %>% 
+  dplyr::filter(treatments.therapeutic_agents %in% "Cisplatin")
+
+library(TCGAbiolinks)
+library(edgeR)
+library(singscore)
+
+.manifest <- "~/projetos/felipeluz/dieila/RNAseq/Validation/gdc_manifest.2026-07-21.111149.txt"
+setwd("~/projetos/felipeluz/dieila/RNAseq")
+
+query <- GDCquery(project = "TCGA-HNSC", 
+                  data.category = "Transcriptome Profiling", 
+                  barcode = unique(TCGA_clinical_cisplatin$cases.submitter_id),
+                  data.type = "Gene Expression Quantification")
+
+GDCdownload(query, files.per.chunk = 200)
+
+rna <- GDCprepare(
+  query,
+  directory = "/data/projetos/felipeluz/dieila/RNAseq/GDCdata",
+  summarizedExperiment = FALSE
+)
+
+resistant_markers = read.csv("~/projetos/felipeluz/dieila/RNAseq/markers_resistant.csv")
+genes_resistant_Di = resistant_markers$X[1:30]
+
+
+genes_resistant_paper = read.csv("~/projetos/felipeluz/dieila/RNAseq/resistance_genes_paper.csv")
+genes_resistant_paper = genes_resistant_paper$HUGO_Gene
+
+
+# Manter genes reptidos com maior expressao media
+rna2 <- as.data.frame(rna)
+
+expr_cols <- grep("^unstranded_", colnames(rna2), value = TRUE)
+
+rna2 <- rna2[, c("gene_name", expr_cols)]
+
+rna2[, expr_cols] <- lapply(rna2[, expr_cols], as.numeric)
+
+rna2$meanExpr <- rowMeans(rna2[, expr_cols])
+
+rna2 <- rna2[order(rna2$gene_name, -rna2$meanExpr), ]
+
+rna2 <- rna2[!duplicated(rna2$gene_name), ]
+
+rownames(rna2) <- rna2$gene_name
+
+rna2$gene_name <- NULL
+rna2$meanExpr <- NULL
+
+dge <- DGEList(counts = as.matrix(rna2))
+dge <- calcNormFactors(dge)
+
+logCPM <- cpm(dge, log = TRUE)
+
+
+
+
+#######################
+# sing Score  #########
+#######################
+
+
+rankData <- rankGenes(logCPM)
+
+################################
+### Plot rank desity ###########
+################################
+plotRankDensity(rankData[,2,drop = FALSE], 
+                upSet = genes_resistant_paper,
+                downSet = genes_resistant_Di, 
+                isInteractive = FALSE)
+
+
+## -- Score Giomo resistance
+scoredf_Di <- simpleScore(rankData, 
+                          upSet = genes_resistant_Di,
+                          centerScore=FALSE)
+
+
+scoredf_Di$sample = rownames(scoredf_Di)
+
+
+## -- Score paper resistance
+scoredf_paper <- simpleScore(rankData, 
+                             upSet = genes_resistant_paper,
+                             centerScore=FALSE)
+
+
+scoredf_paper$sample = rownames(scoredf_paper)
+
+########################################################
+### Dieila Resistance related genes heatmap ############
+########################################################
+
+# Genes resistance Dieila
+sample_shhet = fread("~/projetos/felipeluz/dieila/RNAseq/Validation/gdc_sample_sheet.2026-07-21.tsv")
+Genes_Di_log_cpm_data  = logCPM[genes_resistant_Di,]
+colnames(Genes_Di_log_cpm_data) = gsub("unstranded_","",colnames(Genes_Di_log_cpm_data))
+
+colnames(Genes_Di_log_cpm_data) <- substr(colnames(Genes_Di_log_cpm_data), 1, 12)
+
+
+Annotation = TCGA_clinical_cisplatin[,c(6,10,28,199)]
+Annotation = unique(Annotation)
+rownames(Annotation) = Annotation$cases.submitter_id
+Annotation$cases.submitter_id = NULL
+
+
+pheatmap(Genes_Di_log_cpm_data,
+         cluster_cols = TRUE,
+         scale = "row",
+         show_colnames = TRUE,
+         annotation_col = Annotation,
+         cutree_cols = 2)
+
+
+
+######################################
+## Plot Landscape ####################
+######################################
+plot = plotScoreLandscape(scoredf_paper, scoredf_Di, 
+                          scorenames = c('paper','Di'),hexMin = 1)
+
+Annotation$Sample_name = rownames(Annotation)
+scoredf_paper$Sample_name = gsub("unstranded_","",scoredf_paper$sample)
+scoredf_paper$Sample_name = substr(scoredf_paper$Sample_name, 1, 12)
+scoredf_paper = merge(scoredf_paper, Annotation, by = "Sample_name")
+
+scoredf_Di$Sample_name = gsub("unstranded_","",scoredf_Di$sample)
+scoredf_Di$Sample_name = substr(scoredf_Di$Sample_name, 1, 12)
+scoredf_Di = merge(scoredf_Di, Annotation, by = "Sample_name")
+
+scoredf_paper_filtered = scoredf_paper %>% 
+  filter(!treatments.treatment_outcome %in% c("Unknown","'--"))
+
+scoredf_Di_filtered = scoredf_Di %>% 
+  filter(!treatments.treatment_outcome %in% c("Unknown","'--"))
+
+plot = plotScoreLandscape(scoredf_paper_filtered, scoredf_Di_filtered, 
+                          scorenames = c('paper','Di'),hexMin = 1)
+
+projectScoreLandscape(plotObj = plot,scoredf_paper_filtered, 
+                      scoredf_Di_filtered,isInteractive = FALSE,
+                      annot = "treatments.treatment_outcome")
+
+
+projectScoreLandscape(plotObj = plot,scoredf_paper_filtered, 
+                      scoredf_Di_filtered,isInteractive = FALSE,
+                      annot = "demographic.vital_status")
+
+library(ggpubr)
+library(ggplot2)
+library(FSA)
+library(RColorBrewer)
+
+# Genes paper
+ggplot(scoredf_paper_filtered, aes(x = demographic.vital_status,
+               y = TotalScore,
+               fill = demographic.vital_status)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.7) +
+  scale_fill_brewer(palette = "Pastel1")+
+  theme_classic() +
+  labs(x = "Vital status",
+       y = "Total Score") +
+  theme(legend.position = "none")
+wilcox.test(TotalScore ~ demographic.vital_status, data = scoredf_paper_filtered)
+
+ggplot(scoredf_paper_filtered, aes(x = treatments.treatment_outcome,
+                          y = TotalScore,
+                          fill = treatments.treatment_outcome)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.7) +
+  scale_fill_brewer(palette = "Pastel1")+
+  theme_classic() +
+  labs(x = "Vital status",
+       y = "Total Score") +
+  theme(legend.position = "none")
+
+kruskal.test(TotalScore ~ treatments.treatment_outcome, data = scoredf_paper_filtered)
+
+dunnTest(
+  TotalScore ~ treatments.treatment_outcome,
+  data = scoredf_paper_filtered,
+  method = "bh"
+)
+
+
+# Genes Di
+ggplot(scoredf_Di_filtered, aes(x = demographic.vital_status,
+                          y = TotalScore,
+                          fill = demographic.vital_status)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.7) +
+  scale_fill_brewer(palette = "Pastel1")+
+  theme_classic() +
+  labs(x = "Vital status",
+       y = "Total Score") +
+  theme(legend.position = "none")
+wilcox.test(TotalScore ~ demographic.vital_status, data = scoredf_Di_filtered)
+
+ggplot(scoredf_Di_filtered, aes(x = treatments.treatment_outcome,
+                          y = TotalScore,
+                          fill = treatments.treatment_outcome)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.7) +
+  scale_fill_brewer(palette = "Pastel1")+
+  theme_classic() +
+  labs(x = "Vital status",
+       y = "Total Score") +
+  theme(legend.position = "none")
+
+kruskal.test(TotalScore ~ treatments.treatment_outcome, data = scoredf_Di_filtered)
+
+dunnTest(
+  TotalScore ~ treatments.treatment_outcome,
+  data = scoredf_Di_filtered,
+  method = "bh"
+)
+
+
